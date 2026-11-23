@@ -53,4 +53,12 @@ object CompilerCompat {
   def multiCatchTypes(cdef: dotty.tools.dotc.ast.tpd.CaseDef)(using
       dotty.tools.dotc.core.Contexts.Context
   ): Option[List[dotty.tools.dotc.core.Types.Type]] = None
+
+  /** Can the ownership phase run with this compiler (separation checking and
+   *  `scala.caps.Mutable` are available since Scala 3.9)?
+   */
+  final val supportsOwnership = false
+
+  /** Separation checking is not available before Scala 3.9. */
+  def sepChecksEnabled(using Context): Boolean = false
 }

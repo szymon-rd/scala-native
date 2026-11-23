@@ -53,5 +53,8 @@ class ScalaNativePlugin extends StandardPlugin:
           config
         case (config, _) => config
       }
-    List(PrepNativeInterop(), PostInlineNativeInterop(), GenNIR(genNirSettings))
+    val ownership =
+      if CompilerCompat.supportsOwnership then List(OwnershipPhase()) else Nil
+    List(PrepNativeInterop(), PostInlineNativeInterop()) ++ ownership ++
+      List(GenNIR(genNirSettings))
   }

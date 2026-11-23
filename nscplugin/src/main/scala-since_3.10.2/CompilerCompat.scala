@@ -85,4 +85,13 @@ object CompilerCompat {
     cdef.getAttachment(
       dotty.tools.dotc.transform.TryCatchPatterns.SimpleMultiCatch
     )
+
+  /** Can the ownership phase run with this compiler (separation checking and
+   *  `scala.caps.Mutable` are available since Scala 3.9)?
+   */
+  final val supportsOwnership = true
+
+  /** Is separation checking enabled for the current compilation unit? */
+  def sepChecksEnabled(using Context): Boolean =
+    dotty.tools.dotc.config.Feature.sepChecksEnabled
 }
