@@ -140,10 +140,23 @@ class OwnershipPhase extends PluginPhase with IdentityDenotTransformer {
   /** Can a value of type `tp` hold a reference to an owned object? */
   private def mayRetain(tp: Type)(using Context): Boolean = {
     val w = tp.widenDealias
-    !(w.isPrimitiveValueType ||
-      w.isRef(defn.StringClass) ||
-      isBottom(w))
+    val cls = w.classSymbol
+    !(w.isInstanceOf[ValueType] && pureClasses.contains(cls) || isBottom(w))
   }
+
+  /** Classes whose instances cannot refer to other objects. */
+  private def pureClasses(using Context): Set[Symbol] = Set(
+    defn.UnitClass,
+    defn.BooleanClass,
+    defn.CharClass,
+    defn.ByteClass,
+    defn.ShortClass,
+    defn.IntClass,
+    defn.LongClass,
+    defn.FloatClass,
+    defn.DoubleClass,
+    defn.StringClass
+  )
 
   /** Does `tp` carry an explicit capture set naming capabilities other than the
    *  root capability, e.g. `A^{x}` or `A^{this}`? Such types are borrows.
