@@ -10,6 +10,7 @@ Contributor's Guide
   contributing
   build
   compiler
+  ownership
   nir
   runtime-type-information
   mangling
