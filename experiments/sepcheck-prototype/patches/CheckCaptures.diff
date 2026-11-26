@@ -1,0 +1,99 @@
+--- a/compiler/src/dotty/tools/dotc/cc/CheckCaptures.scala
++++ b/compiler/src/dotty/tools/dotc/cc/CheckCaptures.scala
+@@ -690,7 +690,11 @@
+         // if `ref` is not tracked then the selection could not give anything new
+         // class SerializationProxy in stdlib-cc/../LazyListIterable.scala has an example where this matters.
+         val sel = ref.select(pt.selector).asInstanceOf[TermRef]
+-        markPathFree(sel, pt.pt, pt.tree)
++        if !sel.isTracked && ref.derivesFromStateful then
++          // [ownership] Reading a pure field of a stateful object still reads the
++          // object: charge the prefix as a read-only use, like a read-only method.
++          markFree(ref.mapLocalMutable.readOnly, tree)
++        else markPathFree(sel, pt.pt, pt.tree)
+       case _ =>
+         markFree(ref.mapLocalMutable.adjustReadOnly(pt), tree)
+ 
+@@ -830,7 +834,9 @@
+         // is consumed.
+         capt.println(i"charging deep capture set of $arg: ${argType} = ${argType.deepCaptureSet}")
+         markFree(argType.deepCaptureSet, arg)
+-      if formal.containsGlobalAny then
++      if formal.containsGlobalAny || formal.hasAnnotation(defn.ConsumeAnnot) then
++        // [ownership] consume parameters of type-parameter type (`consume x: T`)
++        // have no `any` in their formal, but still consume their argument.
+         sepCheckFormals(arg) = instantiatedFormal
+       argType
+ 
+@@ -1022,12 +1028,25 @@
+       markFreeTypeArgs(tree.fun, meth, tree.args)
+ 
+       val funType = super.recheckTypeApply(tree, pt)
+-      val res = resultToAny(funType, Origin.ResultInstance(_, funType, tree))
++      val res0 = resultToAny(funType, Origin.ResultInstance(_, funType, tree))
++      val res = castKeepsCaptures(tree, res0)
+       includeCallCaptures(tree.symbol, res, tree)
+       checkContains(tree)
+       res
+     }
+ 
++    /** [ownership] A cast (including the casts that pattern matching generates for
++     *  type patterns) cannot add capabilities: the result keeps the capture set of
++     *  the value being cast, whatever capture set the target type spells out.
++     */
++    private def castKeepsCaptures(tree: TypeApply, res: Type)(using Context): Type =
++      tree.fun match
++        case Select(qual, _) if tree.symbol == defn.Any_typeCast =>
++          val qualCs = qual.nuType.captureSet
++          val target = res.stripCapturing
++          if qualCs.isAlwaysEmpty then target else CapturingType(target, qualCs)
++        case _ => res
++
+     /** Check that capture set of type argument subcaptures capture set of bounds.
+      *  We don't check if
+      *   - the bound is exactly any since that is capture polymorphic top, or
+@@ -1177,7 +1196,9 @@
+                     updateResult(resType)
+             }
+           case SAMType(mt1, _) =>
+-            matchParamsAndResult(paramss, mt1.derivedLambdaType(resType = WildcardType))
++            // [ownership] Check the closure body against the SAM result type;
++            // otherwise a capability can escape through a SAM-converted lambda.
++            matchParamsAndResult(paramss, mt1)
+               // We get failures in stdlib's JavaCollectionWrappers.scala when we
+               // match result types against results of SAM methods. Not clear where
+               // they come from. We work around this by not passing down the result
+@@ -1719,6 +1740,7 @@
+      *  where local capture roots are instantiated to root variables.
+      */
+     override def checkConformsExpr(actual: Type, expected: Type, tree: Tree, notes: List[Note])(using Context): Type =
++      checkNoStatefulToAny(actual, expected, tree)
+       val saved = ccState.ignoreClassifiers
+       printOnAssertionError(i"error while checking $tree: $actual against $expected"):
+         try
+@@ -1729,6 +1751,26 @@
+         finally
+           ccState.ignoreClassifiers = saved
+ 
++    /** [ownership] `Any` is a supertype of every capturing type, so widening a
++     *  value that captures a stateful object to plain `Any` forgets the capture:
++     *  the value could then escape its scope or be used after it was consumed.
++     *  Require `Any^` (or another type that keeps the capture) instead.
++     */
++    private def checkNoStatefulToAny(actual: Type, expected: Type, tree: Tree)(using Context): Unit =
++      expected.dealiasKeepAnnots match
++        case tp: TypeRef if tp.symbol == defn.AnyClass && !actual.hasBoxedCapset
++            && !ctx.owner.ownersIterator.exists(s => s.is(Synthetic) && s.is(Method) && !s.isAnonymousFunction) => // e.g. generated equals
++          val stateful = actual.captureSet.elems.filter: ref =>
++            ref.stripReadOnly match
++              case ref: (TermRef | ThisType) => ref.derivesFromStateful
++              case _ => false
++          if !stateful.isEmpty then
++            report.error(
++              em"""Cannot widen a value capturing ${stateful.toList.map(_.show).mkString(", ")} to Any,
++                  |which would forget the capture. Use Any^ instead.""",
++              tree.srcPos)
++        case _ =>
++
+     @annotation.tailrec
+     private def findImpureUpperBound(tp: Type)(using Context): Type = tp match
+       case _: SingletonType => findImpureUpperBound(tp.widen)

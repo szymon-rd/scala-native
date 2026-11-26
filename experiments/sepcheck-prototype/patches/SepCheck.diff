@@ -1,0 +1,219 @@
+--- a/compiler/src/dotty/tools/dotc/cc/SepCheck.scala
++++ b/compiler/src/dotty/tools/dotc/cc/SepCheck.scala
+@@ -5,6 +5,7 @@
+ import collection.mutable
+ 
+ import core.*
++import config.Feature
+ import Symbols.*, Types.*, Flags.*, Contexts.*, Names.*, Decorators.*
+ import CaptureSet.{Refs, emptyRefs, HiddenSet}
+ import NameKinds.WildcardParamName
+@@ -126,6 +127,16 @@
+       if i < size then locs(i) else null
+ 
+     def clashing(ref: Capability)(using Context): (SrcPos, TypeRole) | Null =
++      val direct = clashingDirect(ref)
++      if direct != null then direct
++      else ref.stripReadOnly match
++        // [ownership] A path `p.f` is unusable once a prefix `p` was consumed.
++        case tr: TermRef => tr.prefix match
++          case pre: (TermRef | ThisType) if pre.isTracked => clashing(pre)
++          case _ => null
++        case _ => null
++
++    private def clashingDirect(ref: Capability)(using Context): (SrcPos, TypeRole) | Null =
+       val refPeaks = ref.directPeaks
+       if !directPeaks.sharedPeaks(refPeaks).isEmpty then
+         var i = 0
+@@ -150,12 +161,48 @@
+     def ++= (that: ConsumedSet)(using Context): Unit =
+       for i <- 0 until that.size do put(that.refs(i), that.locs(i))
+ 
++    /** [ownership] The location where a path rooted at `sym` was moved out of,
++     *  if `sym` (a reference without a tracked capture set, e.g. a list of
++     *  capabilities) is in the set.
++     */
++    def getBySym(sym: Symbol)(using Context): (Capability, (SrcPos, TypeRole)) | Null =
++      var i = 0
++      while i < size && !(refs(i) match
++          case ref: TermRef => ref.symbol == sym
++          case _ => false)
++      do i += 1
++      if i < size then (refs(i), locs(i)) else null
++
++    /** [ownership] Start of the innermost open segment. Entries before it were
++     *  consumed outside the current branch and cannot be forgotten here.
++     */
++    private var segStart = 0
++
++    /** [ownership] A local variable `ref` (its mirror) was assigned: forget its
++     *  consumption within the current segment, since it holds a new value now.
++     */
++    def reinit(ref: Capability)(using Context): Unit =
++      var i = segStart
++      var j = segStart
++      while i < size do
++        if refs(i) ne ref then
++          refs(j) = refs(i)
++          locs(j) = locs(i)
++          j += 1
++        i += 1
++      if j != size then
++        size = j
++        directPeaks = emptyRefs
++        for k <- 0 until size do directPeaks = directPeaks ++ refs(k).directPeaks
++
+     /** Run `op` and return any new references it created in a separate `ConsumedSet`.
+      *  The current mutable set is reset to its state before `op` was run.
+      */
+     def segment(op: => Unit): ConsumedSet =
+       val start = size
+       val savedPeaks = directPeaks
++      val savedSegStart = segStart
++      segStart = start
+       try
+         op
+         if size == start then EmptyConsumedSet
+@@ -163,6 +210,7 @@
+       finally
+         size = start
+         directPeaks  = savedPeaks
++        segStart = savedSegStart
+   end MutConsumedSet
+ 
+   val EmptyConsumedSet = ConstConsumedSet(Array(), Array())
+@@ -627,6 +675,16 @@
+    *  2. Also check that none of the used capabilities was consumed before.
+    */
+   def checkUse(tree: Tree)(using Context): Unit =
++    tree match
++      case id: Ident if id.symbol.isTerm =>
++        // [ownership] A container whose element was moved out cannot be used
++        // again. Such containers have no tracked capture set, so uses of them are
++        // not marked; match them by symbol instead.
++        val moved = consumed.getBySym(id.symbol)
++        if moved != null then
++          val (ref, loc) = moved
++          if !ref.isTracked then consumeError(ref, loc, tree.srcPos)
++      case _ =>
+     val used = tree.markedFree.elems
+     if !used.isEmpty && !isCoverageLiftedTemp(tree) && !isPatmatCast(tree) then
+       capt.println(i"check use $tree: $used")
+@@ -737,6 +795,17 @@
+         for ref <- refsToCheck do
+           if !ref.stripReadOnly.isKnownClassifiedAs(defn.Caps_SharedCapability) then
+             consumed.put(ref, (pos, role))
++        // [ownership] Uses of a local variable are charged to its mirror, so
++        // consuming the variable's value has to consume the mirror as well.
++        // Only for explicit consumption (consume arguments and prefixes); a
++        // variable assigned to an escaping variable keeps its value.
++        val consumedTree = role match
++          case TypeRole.Argument(arg, _) => arg
++          case TypeRole.Qualifier(qual, _) => qual
++          case _ => EmptyTree
++        localVarOf(consumedTree) match
++          case Some(sym) => consumed.put(sym.varMirror.termRef, (pos, role))
++          case _ =>
+       case _ =>
+   }
+ 
+@@ -895,8 +964,13 @@
+           checkNoTParamBounds(refsStar, descr, pos)
+       case TypeRole.Argument(arg, _) =>
+         if tpe.hasAnnotation(defn.ConsumeAnnot) then
+-          val capts = spanCaptures(arg).directFootprint.nonPeaks
++          val unboxedRoots = unboxedFrom(arg)
++          val capts = spanCaptures(arg).directFootprint.nonPeaks ++ unboxedRoots
+           checkConsumedRefs(capts, tpe, role, i"argument to consume parameter with type ${arg.nuType} refers to", pos)
++          // Untracked roots (e.g. a list of capabilities) are not classified, so
++          // they are not recorded by checkConsumedRefs; record them directly.
++          for root <- unboxedRoots do
++            if !root.isTracked then consumed.put(root, (pos, role))
+       case _ =>
+ 
+     if !tpe.hasAnnotation(defn.UntrackedCapturesAnnot) then
+@@ -1063,8 +1137,73 @@
+       // might cause soundness issues.
+ 
+   /** Traverse `tree` and perform separation checks everywhere */
++  /** [ownership] If `tree` takes a value out of a box of a stable path `p`,
++   *  e.g. `p.head` or `p.get` whose declared result type is a bare type
++   *  parameter, then `p`: consuming such a value moves it out of `p`, which
++   *  must count as consuming `p` (as moving out of a container does in Rust).
++   *  Methods with an explicit fresh result (`pop(): T^`) transfer ownership
++   *  and are not affected.
++   */
++  private def unboxedFrom(tree: Tree)(using Context): Refs =
++    def isBareTypeParam(tp: Type): Boolean = tp match
++      case tp: TypeRef => tp.symbol.isAbstractOrParamType
++      case _ => false
++    def receiver(t: Tree): Tree = t match
++      case Apply(fn, _) => receiver(fn)
++      case TypeApply(fn, _) => receiver(fn)
++      case Select(qual, _) => qual
++      case _ => EmptyTree
++    tree match
++      case Typed(expr, _) => unboxedFrom(expr)
++      case _ =>
++        val sym = tree.symbol
++        if sym.exists && sym.isTerm && isBareTypeParam(sym.info.finalResultType.widenExpr) then
++          receiver(tree).tpe match
++            case ref: (TermRef | ThisType)
++            if ref.isTracked || !ref.widen.deepCaptureSet.elems.isEmpty =>
++              SimpleIdentitySet(ref)
++            case _ => emptyRefs
++        else emptyRefs
++
++  /** [ownership] A fresh result type only guarantees ownership transfer if the
++   *  callee was separation checked (otherwise it may return its argument as a
++   *  fresh value). Reject calls of methods from units of this run that were
++   *  compiled without separation checking when their result is fresh.
++   *  Symbols loaded from TASTy are trusted here: recording whether a definition
++   *  was separation checked would need a new TASTy attribute.
++   */
++  private def checkTrustedFreshResult(tree: Tree)(using Context): Unit =
++    val meth = tree.symbol
++    if meth.exists && meth.is(Method) then
++      val unit = ctx.run.nn.units.find(_.source == meth.source)
++      unit match
++        case Some(u) if !u.needsSeparationChecking && !Feature.enabledBySetting(Feature.separationChecking) =>
++          val freshRoots = tree.nuType.captureSet.elems.filter(_.isTerminalCapability)
++          if !freshRoots.isEmpty then
++            report.error(
++              em"""Separation failure: $meth was compiled without separation checking,
++                  |so its fresh result type cannot be trusted to transfer ownership.""",
++              tree.srcPos)
++        case _ =>
++
++  /** [ownership] The local mutable variable `tree` refers to, if any. */
++  private def localVarOf(tree: Tree)(using Context): Option[Symbol] = tree match
++    case Typed(expr, _) => localVarOf(expr)
++    case id: Ident if id.symbol.isMutableVar && id.symbol.owner.isTerm => Some(id.symbol)
++    case _ => None
++
+   def traverse(tree: Tree)(using Context): Unit =
+     if !isAssumedSeparate(tree) then trace(i"checking separate $tree"):
++      tree match
++        case tree @ Assign(lhs, rhs) if localVarOf(lhs).isDefined =>
++          // [ownership] Assigning a local variable gives it a new value: check the
++          // right-hand side, then forget earlier consumption of the variable.
++          traverse(rhs)
++          checkAssign(tree)
++          consumed.reinit(localVarOf(lhs).get.varMirror.termRef)
++          consumed.reinit(localVarOf(lhs).get.termRef)
++          return
++        case _ =>
+       checkUse(tree)
+       tree match
+         case tree @ Select(qual, _) if tree.symbol.is(Method) && tree.symbol.isConsume =>
+@@ -1077,7 +1216,9 @@
+           traverseChildren(tree)
+           tree.tpe match
+             case _: MethodOrPoly =>
+-            case _ => traverseApply(tree)
++            case _ =>
++              traverseApply(tree)
++              checkTrustedFreshResult(tree)
+         case tree: Assign =>
+           traverseChildren(tree)
+           checkAssign(tree)

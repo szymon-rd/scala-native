@@ -1,0 +1,12 @@
+--- a/compiler/src/dotty/tools/dotc/cc/Setup.scala
++++ b/compiler/src/dotty/tools/dotc/cc/Setup.scala
+@@ -1002,6 +1002,9 @@
+           case _ =>
+             mapOver(t)
+         if variance > 0 then t1
++        // [ownership] Parameters of code that was not capture checked accept no
++        // capabilities: that code could retain them without any tracking.
++        else if variance < 0 then t1
+         else decorate(t1, Function.const(CaptureSet.Fluid), this)
+ 
+   /** Replace all universal capture sets in this type by <fluid> */

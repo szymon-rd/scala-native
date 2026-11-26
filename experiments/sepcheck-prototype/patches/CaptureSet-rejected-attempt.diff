@@ -1,0 +1,56 @@
+--- a/compiler/src/dotty/tools/dotc/cc/CaptureSet.scala
++++ b/compiler/src/dotty/tools/dotc/cc/CaptureSet.scala
+@@ -216,6 +216,7 @@
+   protected final def addNewElem(elem: Capability)(using ctx: Context, vs: VarState): Boolean =
+     addThisElem(elem)
+     || !elem.isTerminalCapability
++        && !scopedParamOutOfLevel(elem)
+         && vs.isOpen
+         && {
+           val underlying = elem.captureSetOfInfo
+@@ -224,6 +225,28 @@
+           res
+         }
+ 
++  /** [ownership] Is `elem` a parameter that is not visible at the level of
++   *  this set? A parameter is a capability scoped to its call: widening it to
++   *  its underlying capture set (typically `any`) would let it escape.
++   */
++  private def scopedParamOutOfLevel(elem: Capability)(using Context): Boolean =
++    this match
++      case self: Var =>
++        // Only parameters of anonymous functions: they stand for capabilities
++        // handed in by a higher-order function for the duration of a call.
++        // Method parameters are substituted by their arguments at call sites.
++        elem.core match
++          case ref: TermRef if ref.symbol.is(Param) && ref.symbol.owner.isAnonymousFunction =>
++            !self.levelOK(elem)
++          case _ => false
++      case _ => false
++
++  /** [ownership] Is `elem` (possibly read-only) a reference to a term parameter? */
++  protected def isParamRef(elem: Capability)(using Context): Boolean =
++    elem.core match
++      case ref: TermRef => ref.symbol.is(Param)
++      case _ => false
++
+   /** Add a specific element, assuming it is not already accounted for,
+    *  and omitting any mapping or filtering, without possibility to backtrack
+    *  to the underlying capture set.
+@@ -932,8 +955,14 @@
+       case _ =>
+         if owner.exists then
+           val elemVis = elem.visibility
+-          !elemVis.isProperlyContainedIn(owner)
+-          || nestedOK && elemVis.owner == owner
++          if isParamRef(elem) then
++            // [ownership] A parameter is only visible inside its own method or
++            // function (or in the capture set of a closure directly binding it),
++            // not in sibling scopes.
++            owner.isContainedIn(elemVis) || nestedOK && elemVis.owner == owner
++          else
++            !elemVis.isProperlyContainedIn(owner)
++            || nestedOK && elemVis.owner == owner
+         else true
+ 
+     def addDependent(cs: CaptureSet)(using Context, VarState): Boolean =
