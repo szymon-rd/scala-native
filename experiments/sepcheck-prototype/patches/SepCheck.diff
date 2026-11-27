@@ -8,7 +8,15 @@
  import Symbols.*, Types.*, Flags.*, Contexts.*, Names.*, Decorators.*
  import CaptureSet.{Refs, emptyRefs, HiddenSet}
  import NameKinds.WildcardParamName
-@@ -126,6 +127,16 @@
+@@ -16,6 +17,7 @@
+ import reflect.ClassTag
+ import reporting.trace
+ import Capabilities.*
++import Mutability.isUpdateMethod
+ 
+ /** The separation checker is  a tree traverser that is run after capture checking.
+  *  It checks tree nodes for various separation conditions, explained in the
+@@ -126,6 +128,16 @@
        if i < size then locs(i) else null
  
      def clashing(ref: Capability)(using Context): (SrcPos, TypeRole) | Null =
@@ -25,7 +33,7 @@
        val refPeaks = ref.directPeaks
        if !directPeaks.sharedPeaks(refPeaks).isEmpty then
          var i = 0
-@@ -150,12 +161,48 @@
+@@ -150,12 +162,48 @@
      def ++= (that: ConsumedSet)(using Context): Unit =
        for i <- 0 until that.size do put(that.refs(i), that.locs(i))
  
@@ -74,7 +82,7 @@
        try
          op
          if size == start then EmptyConsumedSet
-@@ -163,6 +210,7 @@
+@@ -163,6 +211,7 @@
        finally
          size = start
          directPeaks  = savedPeaks
@@ -82,10 +90,72 @@
    end MutConsumedSet
  
    val EmptyConsumedSet = ConstConsumedSet(Array(), Array())
-@@ -627,6 +675,16 @@
+@@ -335,6 +384,54 @@
+    */
+   private var previousDefs: List[DefInfo] = Nil
+ 
++  // [ownership] Borrow invalidation by update methods (Rust's `&`/`&mut` rule).
++  /** Order of local value definitions in the traversal. */
++  private var defCounter = 0
++  private val defOrder = util.EqHashMap[Symbol, Int]()
++  /** Updates so far: receiver, order at the update, position. */
++  private val updates = mutable.ArrayBuffer[(Capability, Int, SrcPos)]()
++  /** For each enclosing loop: its start order and the uses in it of locals
++   *  defined before the loop.
++   */
++  private var openLoops: List[(Int, mutable.ArrayBuffer[(Tree, Symbol)])] = Nil
++
++  private def nextOrder(): Int = { defCounter += 1; defCounter }
++
++  /** The receiver of an update: the tracked path of `tree`'s prefix, if any. */
++  private def updatedRef(tree: Tree)(using Context): Capability | Null =
++    def prefixRef(t: Tree): Capability | Null = t.tpe match
++      case ref: (TermRef | ThisType) if ref.isTracked => ref
++      case _ => null
++    tree match
++      case Apply(fn, _) => updatedRef(fn)
++      case TypeApply(fn, _) => updatedRef(fn)
++      case sel @ Select(qual, _) if sel.symbol.isUpdateMethod => prefixRef(qual)
++      case Assign(lhs @ Select(qual, _), _)
++      if !lhs.symbol.hasAnnotation(defn.UntrackedCapturesAnnot) => prefixRef(qual)
++      case _ => null
++
++  private def recordUpdate(tree: Tree)(using Context): Unit =
++    val ref = updatedRef(tree)
++    if ref != null then updates += ((ref, nextOrder(), tree.srcPos))
++
++  /** Does the local `sym`, used at `use`, borrow from a value updated later? */
++  private def checkNotInvalidated(use: Tree, sym: Symbol, after: Int)(using Context): Unit =
++    val usedPeaks = use.markedFree.elems.allPeaks
++    if !usedPeaks.isEmpty then
++      updates.find: (ref, order, _) =>
++        order > after
++        && !SimpleIdentitySet(ref).allPeaks.sharedPeaks(usedPeaks).isEmpty
++        && !(use.tpe match
++              case tr: TermRef => tr.pathRoot eq ref.pathRoot
++              case _ => false)
++      match
++        case Some((ref, _, pos)) =>
++          report.error(
++            em"""Separation failure: $sym borrows from $ref, which was updated at line ${pos.line + 1}
++                |after $sym was defined. A value borrowing from $ref cannot be used after an update of $ref.""",
++            use.srcPos)
++        case None =>
++
+   /** The set of references that were consumed so far in the current method */
+   private var consumed: MutConsumedSet = MutConsumedSet()
+ 
+@@ -627,6 +724,23 @@
     *  2. Also check that none of the used capabilities was consumed before.
     */
    def checkUse(tree: Tree)(using Context): Unit =
++    tree match
++      case id: Ident if defOrder.contains(id.symbol) =>
++        val order = defOrder(id.symbol)
++        checkNotInvalidated(id, id.symbol, order)
++        for (start, uses) <- openLoops do
++          if order < start then uses += ((id, id.symbol))
++      case _ =>
 +    tree match
 +      case id: Ident if id.symbol.isTerm =>
 +        // [ownership] A container whose element was moved out cannot be used
@@ -99,7 +169,7 @@
      val used = tree.markedFree.elems
      if !used.isEmpty && !isCoverageLiftedTemp(tree) && !isPatmatCast(tree) then
        capt.println(i"check use $tree: $used")
-@@ -737,6 +795,17 @@
+@@ -737,6 +851,17 @@
          for ref <- refsToCheck do
            if !ref.stripReadOnly.isKnownClassifiedAs(defn.Caps_SharedCapability) then
              consumed.put(ref, (pos, role))
@@ -117,7 +187,7 @@
        case _ =>
    }
  
-@@ -895,8 +964,13 @@
+@@ -895,8 +1020,13 @@
            checkNoTParamBounds(refsStar, descr, pos)
        case TypeRole.Argument(arg, _) =>
          if tpe.hasAnnotation(defn.ConsumeAnnot) then
@@ -132,7 +202,7 @@
        case _ =>
  
      if !tpe.hasAnnotation(defn.UntrackedCapturesAnnot) then
-@@ -1063,8 +1137,73 @@
+@@ -1063,8 +1193,131 @@
        // might cause soundness issues.
  
    /** Traverse `tree` and perform separation checks everywhere */
@@ -185,6 +255,64 @@
 +              tree.srcPos)
 +        case _ =>
 +
++  /** [ownership] Drop check. With Rust-style drops, each stateful local of a
++   *  block that was not moved is dropped when the block ends, in reverse
++   *  declaration order, and dropping it uses it. Simulate these uses: dropping
++   *  a value that borrows from something consumed in the block (e.g. a `Peek(a)`
++   *  after `free(a)`) is a use after consumption.
++   */
++  private def checkImplicitDrops(block: Block)(using Context): Unit =
++    // Owners the block returns, or hides in its value (a closure or object
++    // capturing them), are moved out of the block, as by Rust's `move`; the
++    // others are dropped here.
++    def returned(t: Tree): List[Symbol] = t match
++      case id: Ident => List(id.symbol)
++      case Typed(e, _) => returned(e)
++      case Block(_, e) => returned(e)
++      case If(_, a, b) => returned(a) ++ returned(b)
++      case Match(_, cases) => cases.flatMap(c => returned(c.body))
++      case _ => Nil
++    val movedOut = returned(block.expr).toSet
++    val resultPeaks = spanCaptures(block.expr).allPeaks
++    for case vd: ValDef <- block.stats.reverse do
++      val sym = vd.symbol
++      if sym.exists && !sym.isOneOf(Lazy | Synthetic | Mutable) && sym.info.derivesFromStateful
++          && initializesOwner(vd.rhs) then
++        val ref = sym.termRef
++        val owned = SimpleIdentitySet(ref).allPeaks
++        val hiddenInResult = !owned.sharedPeaks(resultPeaks).isEmpty
++        if consumed.get(ref) == null && !movedOut.contains(sym) && !hiddenInResult then
++          // moved values are not dropped here
++          var i = 0
++          var clash: (Capability, (SrcPos, TypeRole)) | Null = null
++          while clash == null && i < consumed.size do
++            val other = consumed.refs(i)
++            if (other ne ref) && !(other.pathRoot eq ref)
++                && !SimpleIdentitySet(other).allPeaks.sharedPeaks(owned).isEmpty
++            then clash = (other, consumed.locs(i))
++            i += 1
++          if clash != null then
++            val (other, (pos, role)) = clash
++            report.error(
++              em"""Separation failure: $sym is dropped at the end of its scope, which uses
++                  |$other, which was ${role.howConsumed} at line ${pos.line + 1}.""",
++              vd.srcPos)
++
++  /** [ownership] Does `rhs` create a fresh value that the defined local owns:
++   *  a constructor call, or a call of a method whose declared result type is
++   *  fresh? Aliases and borrows (`val h = x.f`) are not owners and not dropped.
++   */
++  private def initializesOwner(rhs: Tree)(using Context): Boolean = rhs match
++    case Typed(expr, _) => initializesOwner(expr)
++    case Block(_, expr) => initializesOwner(expr)
++    case Inlined(_, _, expr) => initializesOwner(expr)
++    case _ =>
++      val sym = rhs.symbol
++      sym.exists && sym.is(Method) && (
++        sym.isConstructor
++        || (sym.name == nme.apply || !sym.isOneOf(Synthetic | Accessor | ParamAccessor | CaseAccessor))
++            && sym.info.finalResultType.widenExpr.captureSet.elems.exists(_.isTerminalCapability))
++
 +  /** [ownership] The local mutable variable `tree` refers to, if any. */
 +  private def localVarOf(tree: Tree)(using Context): Option[Symbol] = tree match
 +    case Typed(expr, _) => localVarOf(expr)
@@ -206,7 +334,7 @@
        checkUse(tree)
        tree match
          case tree @ Select(qual, _) if tree.symbol.is(Method) && tree.symbol.isConsume =>
-@@ -1077,7 +1216,9 @@
+@@ -1077,16 +1330,26 @@
            traverseChildren(tree)
            tree.tpe match
              case _: MethodOrPoly =>
@@ -214,6 +342,42 @@
 +            case _ =>
 +              traverseApply(tree)
 +              checkTrustedFreshResult(tree)
++              recordUpdate(tree)
          case tree: Assign =>
            traverseChildren(tree)
            checkAssign(tree)
+-        case _: Block | _: Template =>
++          recordUpdate(tree)
++        case block: Block =>
++          traverseSection(block)
++          checkImplicitDrops(block)
++        case _: Template =>
+           traverseSection(tree)
+         case tree: ValDef =>
+           traverseChildren(tree)
+           if !tree.name.is(WildcardParamName) then
+             checkValOrDefDef(tree)
++          if tree.symbol.exists && tree.symbol.owner.isTerm
++              && !tree.symbol.isOneOf(Mutable | Param) then
++            defOrder(tree.symbol) = nextOrder()
+         case tree: DefDef =>
+           if skippable(tree.symbol) then
+             capt.println(i"skipping sep check of ${tree.symbol}")
+@@ -1127,7 +1390,16 @@
+           consumed.segment:
+             traverseChildren(tree)
+         case tree: WhileDo =>
+-          val loopConsumed = consumed.segment(traverseChildren(tree))
++          // [ownership] A use early in the body runs again after an update later
++          // in the body: check borrows defined before the loop against all
++          // updates in the loop.
++          val start = nextOrder()
++          val uses = mutable.ArrayBuffer[(Tree, Symbol)]()
++          openLoops = (start, uses) :: openLoops
++          val loopConsumed =
++            try consumed.segment(traverseChildren(tree))
++            finally openLoops = openLoops.tail
++          for (use, sym) <- uses do checkNotInvalidated(use, sym, defOrder(sym))
+           if loopConsumed.size != 0 then
+             val (ref, loc) = loopConsumed.toMap.head
+             consumeInLoopError(ref, loc)

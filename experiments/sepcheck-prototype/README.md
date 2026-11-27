@@ -36,9 +36,10 @@ of `CompilationTests` and compared by error lines against the unpatched compiler
 | t8 capability passed to code without capture checking (Scala, Java `Thread`) | compiles | rejected |
 | t9 method compiled without separation checking returning its argument as fresh | compiles | rejected |
 
-All 17 positive programs still compile, including `boundary` blocks that break
+All 17 positive Tier-1 programs still compile, including `boundary` blocks that break
 with closures over capabilities from outside the lambda. On the Scala 3 capture checking tests
-(322 pos, 400 neg) the patches change 7 results, all expected consequences:
+(322 pos, 400 neg) the Tier-1 patches change 7 results, all expected
+consequences (Tier 2 adds two more, below):
 
 - `paths-simple-suffix-consume` (pos), `paths-complex-consume`,
   `sep-paths-derivedcaps-consume` (neg): `println(x)` of a value capturing a
@@ -122,10 +123,48 @@ Each change is marked `[ownership]` in the patches.
 - The Java and Scala libraries that are not capture checked become unusable
   with capturing arguments (callbacks, by-name parameters) until annotated.
 
+## Rust parity (Tier 2)
+
+These changes make the checker sound for Rust-style implicit drops: every
+local owner that is not moved is dropped at the end of its block.
+
+| Hole (`suite/neg`) | Unpatched | Patched |
+|---|---|---|
+| u14 using a borrow (`val e = b.peek()`) after an update of `b` | compiles | rejected |
+| u12 dropping a borrower (`Peek(a)`) at scope end after `a` was consumed | compiles | rejected |
+| u10 returning a borrow of a freed value | compiles | rejected |
+
+10. **Hiding is a move** (`SepCheck.checkImplicitDrops`). A local owner that
+    the block returns, or that the block's value hides (a returned closure or an
+    object capturing it, as in `twoRefs(): Pair^ = { ...; Pair(r1, r2) }`), is
+    moved out of the block, as by Rust's `move`; it is not dropped there. This
+    is how separation checking already treats hiding in a fresh result type.
+    Values without drop glue (closures, objects with borrowed fields) then leak
+    rather than being freed while still reachable.
+12. **Drop check** (`SepCheck.checkImplicitDrops`). At the end of each block the
+    implicit drops of its owners are simulated in reverse declaration order:
+    dropping an owner is a use of what it borrows, so dropping `Peek(a)` after
+    `a` was consumed is rejected. Owners are locals initialized by a constructor
+    or a method declared to return a fresh value; aliases and borrows
+    (`val h = x.f`, case class accessors) are not dropped. This is stricter than
+    Rust, which has `#[may_dangle]`.
+14. **Updates invalidate borrows** (`SepCheck.checkNotInvalidated`). After an
+    `update` method call on `b` or an assignment to a field of `b`, a local
+    value defined before it whose capture set overlaps `b` can no longer be
+    used. Locals are matched by definition order, so no liveness analysis is
+    needed; in loops, uses of locals defined before the loop are checked
+    against all updates in the loop. Only local values are checked, not
+    parameters, and assignments to `@untrackedCaptures` fields are not updates.
+    Creating a closure that calls an update method counts as an update, like a
+    mutable borrow in Rust: this adds errors to two Scala 3 tests
+    (`sepchecks`, `sep-freeze-boxes`) at programs Rust rejects as well.
+
+Item 11 (exporting the move sites so a drop insertion phase needs no analysis
+of its own) is not done yet.
+
 ## Not covered
 
 - Capture sets nested inside type arguments of casts.
 - The pattern-binder exemption in the level check is a heuristic found by the
   tests, not derived from a soundness argument.
-- The Rust-parity changes (moves through hiding, exported move sites for drop
-  insertion, drop check, borrow invalidation on `update`) are not prototyped.
+- Item 11, and a drop insertion phase driven by it.
