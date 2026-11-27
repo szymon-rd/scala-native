@@ -8,7 +8,7 @@
          && vs.isOpen
          && {
            val underlying = elem.captureSetOfInfo
-@@ -224,6 +225,28 @@
+@@ -224,6 +225,32 @@
            res
          }
  
@@ -24,7 +24,11 @@
 +        // Method parameters are substituted by their arguments at call sites.
 +        elem.core match
 +          case ref: TermRef if ref.symbol.is(Param) && ref.symbol.owner.isAnonymousFunction =>
-+            !self.levelOK(elem)
++            // Widening to a concrete underlying set (e.g. a capture-set parameter)
++            // is fine; widening a scoped parameter to a root capability is not.
++            !self.owner.is(Case)
++            && elem.captureSetOfInfo.elems.exists(_.isTerminalCapability)
++            && !self.levelOK(elem)
 +          case _ => false
 +      case _ => false
 +
@@ -37,13 +41,13 @@
    /** Add a specific element, assuming it is not already accounted for,
     *  and omitting any mapping or filtering, without possibility to backtrack
     *  to the underlying capture set.
-@@ -932,8 +955,14 @@
+@@ -932,8 +959,14 @@
        case _ =>
          if owner.exists then
            val elemVis = elem.visibility
 -          !elemVis.isProperlyContainedIn(owner)
 -          || nestedOK && elemVis.owner == owner
-+          if isParamRef(elem) then
++          if isParamRef(elem) && !owner.is(Case) then
 +            // [ownership] A parameter is only visible inside its own method or
 +            // function (or in the capture set of a closure directly binding it),
 +            // not in sibling scopes.

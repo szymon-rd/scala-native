@@ -32,11 +32,12 @@ of `CompilationTests` and compared by error lines against the unpatched compiler
 | t6 `consume x: T` with a type parameter | compiles | rejected |
 | t7 local `var` freed twice | compiles | rejected |
 | t7 SAM-converted lambda leaking its parameter | compiles | rejected |
-| t7 `boundary`/`break` leaking a scoped capability | compiles | **compiles** |
+| t7 `boundary`/`break` leaking a scoped capability | compiles | rejected |
 | t8 capability passed to code without capture checking (Scala, Java `Thread`) | compiles | rejected |
 | t9 method compiled without separation checking returning its argument as fresh | compiles | rejected |
 
-All 15 positive programs still compile. On the Scala 3 capture checking tests
+All 17 positive programs still compile, including `boundary` blocks that break
+with closures over capabilities from outside the lambda. On the Scala 3 capture checking tests
 (322 pos, 400 neg) the patches change 7 results, all expected consequences:
 
 - `paths-simple-suffix-consume` (pos), `paths-complex-consume`,
@@ -87,16 +88,18 @@ Each change is marked `[ownership]` in the patches.
      checked against the SAM method's result type. The original code skipped
      this as a workaround for failures in the standard library's
      `JavaCollectionWrappers.scala`, which this prototype does not compile.
-   - `boundary`/`break`: **not fixed.** The inlined `boundary` creates
+   - Scoped parameters widened to `any` (`CaptureSet.Var.levelOK`,
+     `addNewElem`). The inlined `boundary` creates
      `val local: Label[() ->{a.rd} String]`, mentioning a lambda parameter `a`
-     that is not in scope, and the value comes back through an `@unchecked`
-     `Break` pattern. Making parameters invisible in sibling scopes and not
-     widening them to `any` on a level failure fixes it, but also rejects
-     legitimate code (`filter-iterable`, `colltest5`); the attempt is in
-     `patches/CaptureSet-rejected-attempt.diff`. Not trusting capture sets
-     inside type arguments of casts would also close it, at the cost of
-     rejecting `boundary` blocks that break with closures over outer
-     capabilities.
+     that is only in scope inside a sibling lambda. The level check admitted it
+     (it only rejects elements nested more deeply than the variable's owner),
+     and when an element fails the level check its underlying capture set is
+     tried instead, which for `a: Res^` is `any`. Now a parameter is only
+     visible inside its own function (or, as before, in the capture set of a
+     closure that directly binds it), and a parameter of an anonymous function
+     is not widened to a root capability when it fails the level check.
+     Variables owned by pattern binders keep the old rule: lambda parameters
+     legitimately flow into them when checking arguments (`filter-iterable`).
 8. **Code without capture checking accepts no capabilities** (`Setup.fluidify`).
    Parameter types of members of classes that were not capture checked are
    pure instead of fluid, like Rust treating foreign calls as `unsafe`.
@@ -121,7 +124,8 @@ Each change is marked `[ownership]` in the patches.
 
 ## Not covered
 
-- `boundary`/`break` (above).
 - Capture sets nested inside type arguments of casts.
+- The pattern-binder exemption in the level check is a heuristic found by the
+  tests, not derived from a soundness argument.
 - The Rust-parity changes (moves through hiding, exported move sites for drop
   insertion, drop check, borrow invalidation on `update`) are not prototyped.

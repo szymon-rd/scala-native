@@ -16,7 +16,7 @@ if [ ! -d "$W/scala3/tests" ]; then
   printf 'tests/neg-custom-args/captures/\ntests/pos-custom-args/captures/\ntests/run-custom-args/captures/\n' > .git/info/sparse-checkout
   git fetch -q --depth 1 origin refs/tags/3.10.1 && git checkout -q FETCH_HEAD
 fi
-for f in SepCheck CheckCaptures Setup; do
+for f in SepCheck CheckCaptures Setup CaptureSet; do
   cp "$W/compiler-src/dotty/tools/dotc/cc/$f.scala" "$W/src/$f.scala"
   patch -s "$W/src/$f.scala" "$HERE/patches/$f.diff"
 done
