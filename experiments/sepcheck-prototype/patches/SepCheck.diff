@@ -16,7 +16,28 @@
  
  /** The separation checker is  a tree traverser that is run after capture checking.
   *  It checks tree nodes for various separation conditions, explained in the
-@@ -126,6 +128,16 @@
+@@ -31,6 +33,20 @@
+  */
+ object SepCheck:
+ 
++  /** [ownership] What separation checking established about an owner of a
++   *  block or method: the trees where it is moved (consume arguments and
++   *  prefixes, assigned values, tail positions), and whether the value of the
++   *  block or method hides it (moved as by Rust's `move`). A drop insertion
++   *  phase drops every owner that is not moved by the result at the end of
++   *  its scope, guarded by a flag that is cleared at the move sites.
++   */
++  case class OwnerDrop(sym: Symbol, moveSites: List[Tree], movedByResult: Boolean)
++
++  /** [ownership] Owners of a block (on the Block) or of a method's consume
++   *  parameters (on the DefDef), in declaration order.
++   */
++  val OwnerDrops = util.Property.StickyKey[List[OwnerDrop]]()
++
+   /** Enumerates kinds of captures encountered so far */
+   enum Captures derives CanEqual:
+     case None
+@@ -126,6 +142,16 @@
        if i < size then locs(i) else null
  
      def clashing(ref: Capability)(using Context): (SrcPos, TypeRole) | Null =
@@ -33,7 +54,7 @@
        val refPeaks = ref.directPeaks
        if !directPeaks.sharedPeaks(refPeaks).isEmpty then
          var i = 0
-@@ -150,12 +162,48 @@
+@@ -150,12 +176,48 @@
      def ++= (that: ConsumedSet)(using Context): Unit =
        for i <- 0 until that.size do put(that.refs(i), that.locs(i))
  
@@ -82,7 +103,7 @@
        try
          op
          if size == start then EmptyConsumedSet
-@@ -163,6 +211,7 @@
+@@ -163,6 +225,7 @@
        finally
          size = start
          directPeaks  = savedPeaks
@@ -90,7 +111,7 @@
    end MutConsumedSet
  
    val EmptyConsumedSet = ConstConsumedSet(Array(), Array())
-@@ -335,6 +384,54 @@
+@@ -335,6 +398,63 @@
     */
    private var previousDefs: List[DefInfo] = Nil
  
@@ -106,6 +127,15 @@
 +  private var openLoops: List[(Int, mutable.ArrayBuffer[(Tree, Symbol)])] = Nil
 +
 +  private def nextOrder(): Int = { defCounter += 1; defCounter }
++
++  /** [ownership] Move sites of local values and parameters, see `OwnerDrop`. */
++  private val moveSites = mutable.HashMap[Symbol, mutable.ListBuffer[Tree]]()
++
++  private def recordMoveSite(tree: Tree)(using Context): Unit = tree match
++    case Typed(expr, _) => recordMoveSite(expr)
++    case id: Ident if id.symbol.exists && id.symbol.owner.isTerm =>
++      moveSites.getOrElseUpdate(id.symbol, mutable.ListBuffer()) += id
++    case _ =>
 +
 +  /** The receiver of an update: the tracked path of `tree`'s prefix, if any. */
 +  private def updatedRef(tree: Tree)(using Context): Capability | Null =
@@ -145,7 +175,7 @@
    /** The set of references that were consumed so far in the current method */
    private var consumed: MutConsumedSet = MutConsumedSet()
  
-@@ -627,6 +724,23 @@
+@@ -627,6 +747,23 @@
     *  2. Also check that none of the used capabilities was consumed before.
     */
    def checkUse(tree: Tree)(using Context): Unit =
@@ -169,12 +199,17 @@
      val used = tree.markedFree.elems
      if !used.isEmpty && !isCoverageLiftedTemp(tree) && !isPatmatCast(tree) then
        capt.println(i"check use $tree: $used")
-@@ -737,6 +851,17 @@
+@@ -737,6 +874,22 @@
          for ref <- refsToCheck do
            if !ref.stripReadOnly.isKnownClassifiedAs(defn.Caps_SharedCapability) then
              consumed.put(ref, (pos, role))
 +        // [ownership] Uses of a local variable are charged to its mirror, so
 +        // consuming the variable's value has to consume the mirror as well.
++        role match
++          case TypeRole.Argument(arg, _) => recordMoveSite(arg)
++          case TypeRole.Qualifier(qual, _) => recordMoveSite(qual)
++          case TypeRole.RHS(rhs, _) => recordMoveSite(rhs)
++          case _ =>
 +        // Only for explicit consumption (consume arguments and prefixes); a
 +        // variable assigned to an escaping variable keeps its value.
 +        val consumedTree = role match
@@ -187,7 +222,7 @@
        case _ =>
    }
  
-@@ -895,8 +1020,13 @@
+@@ -895,8 +1048,13 @@
            checkNoTParamBounds(refsStar, descr, pos)
        case TypeRole.Argument(arg, _) =>
          if tpe.hasAnnotation(defn.ConsumeAnnot) then
@@ -202,7 +237,7 @@
        case _ =>
  
      if !tpe.hasAnnotation(defn.UntrackedCapturesAnnot) then
-@@ -1063,8 +1193,131 @@
+@@ -1063,8 +1221,160 @@
        // might cause soundness issues.
  
    /** Traverse `tree` and perform separation checks everywhere */
@@ -262,33 +297,62 @@
 +   *  after `free(a)`) is a use after consumption.
 +   */
 +  private def checkImplicitDrops(block: Block)(using Context): Unit =
-+    // Owners the block returns, or hides in its value (a closure or object
-+    // capturing them), are moved out of the block, as by Rust's `move`; the
-+    // others are dropped here.
-+    def returned(t: Tree): List[Symbol] = t match
-+      case id: Ident => List(id.symbol)
++    val owners = block.stats.collect:
++      case vd: ValDef if isOwnerDef(vd) => vd.symbol
++    // `val b: Res^ = a` hides `a` in the new owner `b`: a move of `a`.
++    for case vd: ValDef <- block.stats do
++      if isOwnerDef(vd) && !initializesOwner(vd.rhs) then recordMoveSite(vd.rhs)
++    checkAndExportDrops(block, owners, block.expr)
++
++  /** [ownership] A local value owns what it is initialized with if that is
++   *  fresh, or if its declared type hides another value (`val b: Res^ = a`
++   *  moves `a`, which separation checking makes unusable afterwards).
++   */
++  private def isOwnerDef(vd: ValDef)(using Context): Boolean =
++    val sym = vd.symbol
++    sym.exists && !sym.isOneOf(Lazy | Synthetic | Mutable) && sym.info.derivesFromStateful
++    && (initializesOwner(vd.rhs)
++        || !vd.tpt.isInstanceOf[InferredTypeTree]
++            && sym.info.captureSet.elems.exists(_.isTerminalCapability))
++
++  /** [ownership] Check the implicit drops of `owners` at the end of the scope
++   *  whose value is `result` (drop check), and record them for drop insertion
++   *  on `scope`. Owners the scope returns, or hides in its value (a closure
++   *  or object capturing them), are moved out, as by Rust's `move`.
++   */
++  private def checkAndExportDrops(scope: Tree, owners: List[Symbol], result: Tree)(using Context): Unit =
++    def returned(t: Tree): List[Tree] = t match
++      case id: Ident => List(id)
 +      case Typed(e, _) => returned(e)
 +      case Block(_, e) => returned(e)
 +      case If(_, a, b) => returned(a) ++ returned(b)
 +      case Match(_, cases) => cases.flatMap(c => returned(c.body))
 +      case _ => Nil
-+    val movedOut = returned(block.expr).toSet
-+    val resultPeaks = spanCaptures(block.expr).allPeaks
-+    for case vd: ValDef <- block.stats.reverse do
-+      val sym = vd.symbol
-+      if sym.exists && !sym.isOneOf(Lazy | Synthetic | Mutable) && sym.info.derivesFromStateful
-+          && initializesOwner(vd.rhs) then
-+        val ref = sym.termRef
-+        val owned = SimpleIdentitySet(ref).allPeaks
-+        val hiddenInResult = !owned.sharedPeaks(resultPeaks).isEmpty
++    val tails = returned(result)
++    val movedOut = tails.map(_.symbol).toSet
++    val resultPeaks = spanCaptures(result).allPeaks
++    val exported = owners.map: sym =>
++      val owned = SimpleIdentitySet(sym.termRef).allPeaks
++      val hiddenInResult = !movedOut.contains(sym) && !owned.sharedPeaks(resultPeaks).isEmpty
++      val sites = moveSites.getOrElse(sym, Nil).toList ++ tails.filter(_.symbol == sym)
++      OwnerDrop(sym, sites, hiddenInResult)
++    if exported.nonEmpty then scope.putAttachment(OwnerDrops, exported)
++    for sym <- owners.reverse do
++      val vd = sym
++      val ref = sym.termRef
++      val owned = SimpleIdentitySet(ref).allPeaks
++      val hiddenInResult = !owned.sharedPeaks(resultPeaks).isEmpty
++      if true then
 +        if consumed.get(ref) == null && !movedOut.contains(sym) && !hiddenInResult then
-+          // moved values are not dropped here
++          // moved values are not dropped here. Dropping `sym` uses what it
++          // borrows: the explicit references of its capture set.
++          val borrowed = sym.info.captureSet.elems.filter(!_.isTerminalCapability).allPeaks
 +          var i = 0
 +          var clash: (Capability, (SrcPos, TypeRole)) | Null = null
 +          while clash == null && i < consumed.size do
 +            val other = consumed.refs(i)
 +            if (other ne ref) && !(other.pathRoot eq ref)
-+                && !SimpleIdentitySet(other).allPeaks.sharedPeaks(owned).isEmpty
++                && !SimpleIdentitySet(other).allPeaks.sharedPeaks(borrowed).isEmpty
 +            then clash = (other, consumed.locs(i))
 +            i += 1
 +          if clash != null then
@@ -296,7 +360,7 @@
 +            report.error(
 +              em"""Separation failure: $sym is dropped at the end of its scope, which uses
 +                  |$other, which was ${role.howConsumed} at line ${pos.line + 1}.""",
-+              vd.srcPos)
++              scope.srcPos)
 +
 +  /** [ownership] Does `rhs` create a fresh value that the defined local owns:
 +   *  a constructor call, or a call of a method whose declared result type is
@@ -334,7 +398,7 @@
        checkUse(tree)
        tree match
          case tree @ Select(qual, _) if tree.symbol.is(Method) && tree.symbol.isConsume =>
-@@ -1077,16 +1330,26 @@
+@@ -1077,16 +1387,26 @@
            traverseChildren(tree)
            tree.tpe match
              case _: MethodOrPoly =>
@@ -363,7 +427,18 @@
          case tree: DefDef =>
            if skippable(tree.symbol) then
              capt.println(i"skipping sep check of ${tree.symbol}")
-@@ -1127,7 +1390,16 @@
+@@ -1096,6 +1416,10 @@
+                 for params <- tree.paramss; case param: ValDef <- params do
+                   pushDef(param, emptyRefs)
+                 traverseChildren(tree)
++                // [ownership] consume parameters are owned by the method body
++                val owners = tree.termParamss.flatten.collect:
++                  case p if p.symbol.isConsume && p.symbol.info.derivesFromStateful => p.symbol
++                if owners.nonEmpty then checkAndExportDrops(tree, owners, tree.rhs)
+           checkValOrDefDef(tree)
+         case If(cond, thenp, elsep) =>
+           traverse(cond)
+@@ -1127,7 +1451,16 @@
            consumed.segment:
              traverseChildren(tree)
          case tree: WhileDo =>

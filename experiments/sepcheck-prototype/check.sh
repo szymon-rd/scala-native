@@ -22,3 +22,14 @@ echo "== hole suite, unpatched";  python3 -I "$H/compare.py" "$W/out/suite.expec
 echo "== hole suite, patched";    python3 -I "$H/compare.py" "$W/out/suite.expected" "$W/out/suite.results" "$W/out/suite-base.results"
 echo "== Scala 3 capture checking tests, patched vs unpatched"
 python3 -I "$H/compare.py" "$W/out/dotty.expected" "$W/out/dotty.results" "$W/out/dotty-base.results"
+
+# Mechanical drop insertion driven by what separation checking exported.
+echo "== drop insertion demo (patched checker + ownership-drops plugin)"
+P=$W/dropplugin && rm -rf "$P" "$W/demo" && mkdir -p "$P" "$W/demo"
+java -Xss16m -cp "$W/classes:$CCCOMP:$CCLIB" dotty.tools.dotc.Main -usejavacp -classpath "$W/classes:$CCCOMP:$CCLIB" \
+  -d "$P" -nowarn "$HERE/dropphase/DropPlugin.scala" || { echo "PLUGIN BUILD FAILED (rerun setup.sh?)"; exit 1; }
+cp "$HERE/dropphase/plugin.properties" "$P/" && (cd "$P" && jar cf ../dropplugin.jar .)
+java -Xss16m -cp "$W/classes:$CCCOMP:$CCLIB" dotty.tools.dotc.Main -usejavacp -classpath "$CCLIB" \
+  -Xplugin:"$W/dropplugin.jar" -d "$W/demo" "$HERE/dropdemo/Rt.scala" "$HERE/dropdemo/Demo.scala" \
+  || { echo "DEMO BUILD FAILED"; exit 1; }
+java -cp "$W/demo:$CCLIB" Main

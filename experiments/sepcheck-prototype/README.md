@@ -159,12 +159,51 @@ local owner that is not moved is dropped at the end of its block.
     mutable borrow in Rust: this adds errors to two Scala 3 tests
     (`sepchecks`, `sep-freeze-boxes`) at programs Rust rejects as well.
 
-Item 11 (exporting the move sites so a drop insertion phase needs no analysis
-of its own) is not done yet.
+11. **Move sites are exported** (`SepCheck.OwnerDrops`). For each block, and for
+    the `consume` parameters of each method, separation checking attaches its
+    owners with their move sites (consume arguments and prefixes, assigned
+    values, explicit-type moves `val b: Res^ = a`, tail positions) and whether
+    the scope's value hides them. A local is an owner if it is initialized by a
+    constructor or a method declared to return a fresh value, or if its
+    explicit type hides another value.
+
+## Drop insertion without an ownership checker
+
+`dropphase/DropPlugin.scala` is a compiler plugin that runs right after `cc`
+and only rewrites: for every exported owner not moved by its scope's value it
+adds a flag, clears it at the move sites, and drops the owner in a `finally`
+at the end of the scope, in reverse declaration order. It has no move, borrow
+or escape analysis of its own (compare `nscplugin/.../OwnershipPhase.scala`).
+
+`dropdemo/` runs it on the JVM; the runtime records freed objects, so a second
+free or a use of a freed object is logged. `check.sh` prints:
+
+```
+scope: use ab, drop b, drop a
+moves: took m, drop m, after take
+conditional true: took ctrue, drop ctrue, end
+conditional false: end, drop cfalse
+returned: made r, drop r
+picked true: drop b, picked a, drop a
+picked false: drop a, picked b, drop b
+explicitMove: moved x, drop x
+alias: alias al, drop al
+exception: drop e, caught
+closure: closure closure
+borrower: peek pa, drop peek(pa), drop pa
+loop: iter l0, drop l0, iter l1, drop l1
+frees=17
+```
+
+18 objects are allocated and 17 freed: the owner captured by the returned
+closure is moved into it, and closures have no drop glue, so it leaks.
 
 ## Not covered
 
 - Capture sets nested inside type arguments of casts.
 - The pattern-binder exemption in the level check is a heuristic found by the
   tests, not derived from a soundness argument.
-- Item 11, and a drop insertion phase driven by it.
+- Temporaries (fresh values that are not bound to a name) are not dropped.
+- Drop glue for owning fields and for closures that captured an owner.
+- Using the patched checker in the Scala Native build: the drop phase there
+  still has its own analysis.
